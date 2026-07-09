@@ -37,6 +37,87 @@ from astro_calculator import (
     get_modality
 )
 
+# ============== JSON Serialization Helpers ==============
+
+def serialize_for_json(obj: Any) -> Any:
+    """Recursively convert objects to JSON-serializable Python types.
+    
+    Handles numpy types, tuples, and other non-standard types that may
+    appear in Swiss Ephemeris calculations.
+    """
+    import types
+    
+    # Handle None
+    if obj is None:
+        return None
+    
+    # Handle numpy types
+    if hasattr(obj, 'item'):  # numpy scalar
+        return obj.item()
+    if hasattr(obj, 'tolist'):  # numpy array
+        return obj.tolist()
+    
+    # Handle tuple - convert to list
+    if isinstance(obj, tuple):
+        return [serialize_for_json(item) for item in obj]
+    
+    # Handle types.SimpleNamespace (like namespace from functools)
+    if isinstance(obj, types.SimpleNamespace):
+        return serialize_for_json(vars(obj))
+    
+    # Handle dictionaries
+    if isinstance(obj, dict):
+        return {str(k): serialize_for_json(v) for k, v in obj.items()}
+    
+    # Handle lists/tuples
+    if isinstance(obj, (list, tuple, set, frozenset)):
+        return [serialize_for_json(item) for item in obj]
+    
+    # Handle numbers (int, float, numpy number)
+    if isinstance(obj, (int, float)):
+        # Check for numpy number types
+        if hasattr(obj, 'dtype'):
+            return float(obj) if 'float' in str(obj.dtype) else int(obj)
+        return obj
+    
+    # Handle booleans
+    if isinstance(obj, bool):
+        return obj
+    
+    # Handle strings
+    if isinstance(obj, str):
+        return obj
+    
+    # Handle datetime objects
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    
+    # For any other type, try to convert to string
+    try:
+        return str(obj)
+    except:
+        return None
+
+
+def validate_chart_response(chart_data: dict) -> bool:
+    """Validate that chart data has all required fields and proper types."""
+    required_string_fields = ['sun_sign', 'moon_sign', 'rising_sign']
+    required_dict_fields = ['planets', 'houses', 'aspects']
+    
+    for field in required_string_fields:
+        if field not in chart_data or not isinstance(chart_data[field], str):
+            logging.warning(f"Chart validation failed: missing or invalid {field}")
+            return False
+    
+    for field in required_dict_fields:
+        if field not in chart_data or not isinstance(chart_data[field], (dict, list)):
+            logging.warning(f"Chart validation failed: missing or invalid {field}")
+            return False
+    
+    return True
+
+
+
 # Modular engines (from Gab44-vision merge)
 from numerology import calculate_full_profile as numerology_full_profile
 from gematria import calculate_all as gematria_calculate_all
@@ -355,6 +436,34 @@ class CompatibilityRequest(BaseModel):
     partner_birth_place: str
     partner_birth_name: Optional[str] = None  # legal birth name for numerology
     relationship_type: str = "romantic"  # romantic | friendship | family | business | colleague
+
+    @validator('partner_birth_time')
+    def validate_birth_time(cls, v):
+        # Empty string is not allowed - convert to None
+        if v == '':
+            return None
+        return v
+
+    @validator('partner_birth_place')
+    def validate_birth_place(cls, v):
+        # Validate that place is not empty and not the default ocean coordinates
+        if not v or not v.strip():
+            raise ValueError('Birth place is required')
+        # Check for invalid coordinates (0.0, 0.0) - this is in the Atlantic Ocean
+        v_lower = v.lower().strip()
+        if v_lower in ['0,0', '0.0, 0.0', '0 0', '(0, 0)', '(0.0, 0.0)']:
+            raise ValueError('Please provide a valid city or location')
+        return v
+
+    @validator('partner_birth_date')
+    def validate_birth_date(cls, v):
+        # Validate date format YYYY-MM-DD
+        from datetime import datetime
+        try:
+            datetime.strptime(v, '%Y-%m-%d')
+        except ValueError:
+            raise ValueError('Birth date must be in YYYY-MM-DD format')
+        return v
 
 class SynastryAspect(BaseModel):
     person1_planet: str
@@ -1500,16 +1609,31 @@ async def get_my_chart(user: dict = Depends(get_current_user), recalculate: bool
             latitude=latitude,
             longitude=longitude
         )
-
+        
+        # Ensure all data is JSON serializable
+        chart_data = serialize_for_json(chart_data)
+        
         # Calculate numerology from name and birth date
         numerology_name = (user.get("birth_name") or user.get("name") or "").strip()
         numerology = calculate_numerology(numerology_name, birth_date) if numerology_name else {}
         gematria = calculate_gematria(numerology_name) if numerology_name else {}
+        
+        # Serialize numerology and gematria as well
+        numerology = serialize_for_json(numerology)
+        gematria = serialize_for_json(gematria)
     except Exception as e:
         logging.error("Chart calculation failed for user %s: %s", user["id"], e)
         raise HTTPException(
             status_code=500,
             detail="Chart calculation failed. Please check your birth date and try again.",
+        )
+
+    # Validate response before returning
+    if not validate_chart_response(chart_data):
+        logging.error("Chart validation failed for user %s: invalid response structure", user["id"])
+        raise HTTPException(
+            status_code=500,
+            detail="Chart data validation failed. Please try again.",
         )
 
     # Build chart document
@@ -1829,6 +1953,7 @@ async def get_upcoming_transits(user: dict = Depends(get_current_user)):
                 latitude, longitude = get_coordinates(birth_place)
 
         chart_data = calculate_natal_chart(birth_date, birth_time, latitude, longitude)
+        chart_data = serialize_for_json(chart_data)
         natal_positions = chart_data.get("planets", {})
 
         # Upsert the cache with the new schema version so subsequent calls are fast.
